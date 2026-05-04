@@ -913,18 +913,22 @@ class FixSymmetry(SystemConstraint):
             rots = self.rotations[ci].to(dtype=dtype)
             stress[si] = symmetrize_rank2(state.row_vector_cell[si], stress[si], rots)
 
-    def adjust_cell(self, state: SimState, cell: torch.Tensor) -> None:
+    def adjust_cell(
+        self, state: SimState, cell: torch.Tensor, max_delta_component: float = 0.25
+    ) -> None:
         """Symmetrize cell deformation gradient in-place.
 
         Computes ``F = inv(cell) @ new_cell_row``, symmetrizes ``F - I`` as a
         rank-2 tensor, then reconstructs ``cell @ (sym(F-I) + I)``.
 
-        Per-step deformation is clamped at 0.25 to avoid ill-conditioned
-        symmetrization, matching the ASE FixSymmetry behaviour.
+        Per-step deformation is clamped at max_delta_component to avoid
+        ill-conditioned symmetrization, matching the ASE FixSymmetry behaviour.
 
         Args:
             state: Current simulation state.
             cell: Cell tensor (n_systems, 3, 3) in column vector convention.
+            max_delta_component: Maximum component of the per-step deformation
+                gradient to allow.
 
         Raises:
             RuntimeError: If deformation gradient contains NaN or Inf.
@@ -948,8 +952,8 @@ class FixSymmetry(SystemConstraint):
                     f"FixSymmetry: deformation gradient is {max_delta}, "
                     f"cell may be singular or ill-conditioned."
                 )
-            if max_delta > 0.25:
-                deform_delta = deform_delta * (0.25 / max_delta)
+            if max_delta > max_delta_component:
+                deform_delta = deform_delta * (max_delta_component / max_delta)
 
             # Symmetrize the per-step deformation
             rots = self.rotations[ci].to(dtype=state.dtype)
