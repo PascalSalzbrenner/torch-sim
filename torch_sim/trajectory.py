@@ -955,7 +955,7 @@ class TorchSimTrajectory:
         if name not in self.array_registry:
             return None
         steps_node = self._file.get_node("/steps/", name=name)
-        if len(steps_node) == 0:
+        if not isinstance(steps_node, tables.Array) or len(steps_node) == 0:
             return None
         return int(steps_node[-1])
 
