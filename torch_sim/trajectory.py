@@ -31,7 +31,6 @@ import copy
 import inspect
 import logging
 import pathlib
-import warnings
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, Self
@@ -227,7 +226,7 @@ class TrajectoryReporter:
         """
         if step <= 0:
             raise ValueError(f"Step must be greater than 0. Got step={step}.")
-        last_steps = self.last_steps
+        last_steps = self.last_written_steps
         if any(s is None for s in last_steps):
             raise ValueError("Cannot truncate: one or more trajectories are empty.")
         if step > min(last_steps):
@@ -442,6 +441,30 @@ class TrajectoryReporter:
                     last_steps.append(traj.last_step)
         return last_steps
 
+    @property
+    def last_written_steps(self) -> list[int | None]:
+        """Get the largest step recorded across all arrays of each trajectory file.
+
+        Unlike :attr:`last_steps`, which only tracks the ``positions`` cadence, this
+        is the correct basis for resuming a run when different arrays are written at
+        different frequencies.
+
+        Returns:
+            list[int | None]: The largest recorded step number for each trajectory,
+                or None if the trajectory is empty. Returns an empty list if no
+                trajectories exist.
+        """
+        if not self.trajectories:
+            return []
+        last_steps = []
+        for trajectory in self.trajectories:
+            if trajectory._file.isopen:
+                last_steps.append(trajectory.last_written_step)
+            else:
+                with TorchSimTrajectory(trajectory._file.filename, mode="r") as traj:
+                    last_steps.append(traj.last_written_step)
+        return last_steps
+
     def __enter__(self) -> Self:
         """Support the context manager protocol.
 
@@ -537,18 +560,6 @@ class TorchSimTrajectory:
         self.type_map = self._initialize_type_map(
             coerce_to_float32=coerce_to_float32, coerce_to_int32=coerce_to_int32
         )
-        if mode == "a" and self.last_step is not None:
-            inconsistent_step = any(
-                self.get_steps(name)[-1] > self.last_step for name in self.array_registry
-            )
-            if inconsistent_step:
-                msg = (
-                    "Inconsistent last steps detected in trajectory arrays. "
-                    "Truncating all arrays to the `positions` array's last step."
-                )
-                warnings.warn(msg, UserWarning, stacklevel=2)
-                logger.warning(msg)
-                self.truncate_to_step(self.last_step)
 
     def _initialize_header(self, metadata: dict[str, str] | None = None) -> None:
         """Initialize the HDF5 file header with metadata.
@@ -853,7 +864,48 @@ class TorchSimTrajectory:
         """
         if not self.array_registry or "positions" not in self.array_registry:
             return None
-        return self.get_steps("positions")[-1].item()
+        return self.last_step_of("positions")
+
+    def last_step_of(self, name: str) -> int | None:
+        """Get the last recorded step of a single array.
+
+        Uses a direct slice of the steps node rather than reading the whole
+        array, which is O(1) rather than O(rows).
+
+        Args:
+            name (str): Name of the array
+
+        Returns:
+            int | None: The last recorded step, or None if the array is absent
+        """
+        if name not in self.array_registry:
+            return None
+        steps_node = self._file.get_node("/steps/", name=name)
+        if len(steps_node) == 0:
+            return None
+        return int(steps_node[-1])
+
+    @property
+    def last_written_step(self) -> int | None:
+        """Largest step recorded across *all* arrays.
+
+        Unlike :attr:`last_step`, which only tracks the ``positions`` cadence,
+        this is the correct basis for resuming a run: writing strictly beyond it
+        guarantees the per-array step monotonicity that ``_validate_array``
+        enforces, whatever cadence each individual array uses.
+
+        Returns:
+            int | None: The largest recorded step number, or None if the
+                trajectory holds no data.
+        """
+        if not self.array_registry:
+            return None
+        last_steps = [
+            step
+            for step in (self.last_step_of(name) for name in self.array_registry)
+            if step is not None
+        ]
+        return max(last_steps) if last_steps else None
 
     def __str__(self) -> str:
         """Get a string representation of the trajectory.
@@ -1200,17 +1252,18 @@ class TorchSimTrajectory:
         Args:
             step (int): Desired last step of the trajectory after truncation
         """
-        if self.last_step is None:
+        last_written_step = self.last_written_step
+        if last_written_step is None:
             raise ValueError(
                 "Cannot truncate an empty trajectory (no data has been written)."
             )
-        if self.last_step < step:
+        if last_written_step < step:
             raise ValueError(
                 f"Cannot truncate to a step greater than the last step."
-                f" {self.last_step=} < {step=}"
+                f" {last_written_step=} < {step=}"
             )
-        if self.last_step == step:
-            return  # No truncation needed
+        if last_written_step == step:
+            return  # no array holds steps beyond `step`, nothing to truncate
         if step <= 0:
             raise ValueError(f"Step must be larger than 0. Got {step=}")
         for name in self.array_registry:
@@ -1221,9 +1274,10 @@ class TorchSimTrajectory:
             if set(steps_data) == {0}:
                 continue  # skip global arrays
             # Find the index where the step is less than or equal to the desired step
-            # We know that it must be at least one index because of the earlier check.
             indices = np.where(steps_data <= step)[0]
-            length = indices[-1] + 1  # +1 because we want to include this index
+            # +1 because we want to include this index; an array written entirely
+            # after `step` is emptied.
+            length = int(indices[-1]) + 1 if len(indices) else 0
 
             data_node = self._file.get_node("/data/", name=name)
             if isinstance(data_node, tables.EArray):

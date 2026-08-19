@@ -115,12 +115,14 @@ def _determine_initial_step_for_integrate(
             check for resume information
 
     Returns:
-        int: The initial step to start from (1 if not resuming, otherwise last_step + 1)
+        int: The initial step to start from (1 if not resuming, otherwise the largest
+            step recorded in any array of any trajectory + 1)
     """
     initial_step: int = 1
     if trajectory_reporter is not None and trajectory_reporter.mode == "a":
         last_logged_steps = [
-            step if step is not None else 0 for step in trajectory_reporter.last_steps
+            step if step is not None else 0
+            for step in trajectory_reporter.last_written_steps
         ]
         last_logged_step = min(last_logged_steps)
         initial_step = initial_step + last_logged_step
@@ -129,7 +131,7 @@ def _determine_initial_step_for_integrate(
                 f"Trajectory files have different last steps: {set(last_logged_steps)} "
                 "Cannot resume integration from inconsistent states."
                 "You can truncate the trajectories to the same step using:\n\n"
-                "    reporter.truncate_to_step(min(reporter.last_step))\n\n"
+                "    reporter.truncate_to_step(min(reporter.last_written_steps))\n\n"
                 "before calling integrate again."
             )
         if last_logged_step > 0:
@@ -161,7 +163,7 @@ def _determine_initial_step_for_optimize(
         size=(state.n_systems,), fill_value=1, dtype=torch.long, device=state.device
     )
     if trajectory_reporter is not None and trajectory_reporter.mode == "a":
-        last_steps = trajectory_reporter.last_steps
+        last_steps = trajectory_reporter.last_written_steps
         last_steps = [step if step is not None else 0 for step in last_steps]
         last_logged_steps = torch.tensor(
             last_steps, dtype=torch.long, device=state.device
