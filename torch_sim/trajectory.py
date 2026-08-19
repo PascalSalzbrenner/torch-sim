@@ -264,7 +264,12 @@ class TrajectoryReporter:
                     self.prop_calculators[frequency][name] = new_fn
 
     def report(
-        self, state: SimState, step: int | list[int], model: ModelInterface | None = None
+        self,
+        state: SimState,
+        step: int | list[int],
+        model: ModelInterface | None = None,
+        *,
+        force: bool = False,
     ) -> list[dict[str, torch.Tensor]]:
         """Report a state and step to the trajectory files.
 
@@ -282,6 +287,10 @@ class TrajectoryReporter:
             model (ModelInterface, optional): Model used for simulation.
                 Defaults to None. Must be provided if any prop_calculators
                 are provided.
+            force (bool): If True, bypass the frequency gates and write every array
+                whose last recorded step is below ``step``. Used to capture the
+                initial and final frames of a run, which need not lie on the
+                cadence grid. Defaults to False.
 
         Returns:
             list[dict[str, torch.Tensor]]: Map of property names to tensors for each
@@ -310,33 +319,98 @@ class TrajectoryReporter:
         # Process each system separately
         for idx, substate in enumerate(split_states):
             sys_step = step[idx] if isinstance(step, list) else step
-            # Write state to trajectory if it's time
-            if self.state_frequency and sys_step % self.state_frequency == 0:
-                self.trajectories[idx].write_state(
-                    substate, sys_step, **self.state_kwargs
-                )
-
-            all_state_props = {}
-            # Process property calculators for this system
-            for report_frequency, calculators in self.prop_calculators.items():
-                if sys_step % report_frequency != 0 or report_frequency == 0:
-                    continue
-
-                # Calculate properties for this substate
-                props = {}
-                for prop_name, prop_fn in calculators.items():
-                    prop = prop_fn(substate, model)
-                    if len(prop.shape) == 0:
-                        prop = prop.unsqueeze(0)
-                    props[prop_name] = prop
-
-                # Write properties to this trajectory
-                if props:
-                    all_state_props.update(props)
-                    self.trajectories[idx].write_arrays(props, sys_step)
-            all_props.append(all_state_props)
+            all_props.append(
+                self._report_system(idx, substate, sys_step, model, force=force)
+            )
 
         return all_props
+
+    def _report_system(  # noqa: C901
+        self,
+        idx: int,
+        substate: SimState,
+        sys_step: int,
+        model: ModelInterface | None = None,
+        *,
+        force: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Write a single system's state and properties to its trajectory file.
+
+        Args:
+            idx (int): Index of the trajectory file to write to
+            substate (SimState): Single-system state to write
+            sys_step (int): Step to label the written frames with
+            model (ModelInterface, optional): Model used for simulation
+            force (bool): Bypass the frequency gates, writing any array whose last
+                recorded step is below ``sys_step``.
+
+        Returns:
+            dict[str, torch.Tensor]: Map of property names to tensors.
+        """
+        trajectory = self.trajectories[idx]
+
+        # Write state to trajectory if it's time
+        if self.state_frequency and (force or sys_step % self.state_frequency == 0):
+            last_state_step = trajectory.last_step
+            already_written = (
+                force and last_state_step is not None and last_state_step >= sys_step
+            )
+            if not already_written:
+                trajectory.write_state(substate, sys_step, **self.state_kwargs)
+
+        all_state_props: dict[str, torch.Tensor] = {}
+        # Process property calculators for this system
+        for report_frequency, calculators in self.prop_calculators.items():
+            if report_frequency == 0:
+                continue
+            if not force and sys_step % report_frequency != 0:
+                continue
+
+            # Calculate properties for this substate
+            props = {}
+            for prop_name, prop_fn in calculators.items():
+                prop = prop_fn(substate, model)
+                if len(prop.shape) == 0:
+                    prop = prop.unsqueeze(0)
+                props[prop_name] = prop
+
+            # Write properties to this trajectory
+            if props:
+                all_state_props.update(props)
+                if force:
+                    props = {
+                        name: value
+                        for name, value in props.items()
+                        if (last := trajectory.last_step_of(name)) is None
+                        or last < sys_step
+                    }
+                if props:
+                    trajectory.write_arrays(props, sys_step)
+
+        return all_state_props
+
+    def report_final_frame(
+        self,
+        index: int,
+        state: SimState,
+        step: int,
+        model: ModelInterface | None = None,
+    ) -> None:
+        """Write the final frame of a single system, bypassing the cadence grid.
+
+        Runs generally terminate at a step that is not a multiple of
+        ``state_frequency``, which would leave the final state absent from its own
+        trajectory. This writes it unconditionally, skipping any array that already
+        holds a step at or beyond ``step`` so a run that ends on-grid is not
+        double-written.
+
+        Args:
+            index (int): Index of the trajectory file to write to
+            state (SimState): Single-system final state
+            step (int): Final step of that system
+            model (ModelInterface, optional): Model used for simulation
+        """
+        self._report_system(index, state, step, model, force=True)
 
     def _extract_props_batched(
         self,
